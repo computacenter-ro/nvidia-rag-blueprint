@@ -63,6 +63,9 @@ from nvidia_rag.rag_server.response_generator import (
     APIError,
     Citations,
     ErrorCodeMapping,
+    PipelineStepEvent,
+    PipelineStepStatus,
+    PipelineStepType,
     RAGResponse,
     generate_answer_async,
     prepare_citations,
@@ -104,6 +107,79 @@ async def _async_iter(items) -> AsyncGenerator[Any, None]:
     """Helper to convert a list to an async generator."""
     for item in items:
         yield item
+
+
+class PipelineStepTracker:
+    """Helper class to track and record pipeline step events for visualization dashboards."""
+
+    def __init__(self):
+        self.events: list[PipelineStepEvent] = []
+        self._step_start_times: dict[PipelineStepType, float] = {}
+
+    def start_step(
+        self, step_type: PipelineStepType, metadata: dict[str, Any] | None = None
+    ) -> None:
+        """Record the start of a pipeline step."""
+        self._step_start_times[step_type] = time.time()
+        self.events.append(
+            PipelineStepEvent.create(
+                step_type=step_type,
+                status=PipelineStepStatus.RUNNING,
+                metadata=metadata or {},
+            )
+        )
+
+    def complete_step(
+        self, step_type: PipelineStepType, metadata: dict[str, Any] | None = None
+    ) -> None:
+        """Record successful completion of a pipeline step."""
+        start_time = self._step_start_times.get(step_type)
+        duration_ms = None
+        if start_time:
+            duration_ms = (time.time() - start_time) * 1000
+
+        self.events.append(
+            PipelineStepEvent.create(
+                step_type=step_type,
+                status=PipelineStepStatus.COMPLETED,
+                duration_ms=duration_ms,
+                metadata=metadata or {},
+            )
+        )
+
+    def fail_step(
+        self, step_type: PipelineStepType, error: str, metadata: dict[str, Any] | None = None
+    ) -> None:
+        """Record failure of a pipeline step."""
+        start_time = self._step_start_times.get(step_type)
+        duration_ms = None
+        if start_time:
+            duration_ms = (time.time() - start_time) * 1000
+
+        error_metadata = {"error": error}
+        if metadata:
+            error_metadata.update(metadata)
+
+        self.events.append(
+            PipelineStepEvent.create(
+                step_type=step_type,
+                status=PipelineStepStatus.FAILED,
+                duration_ms=duration_ms,
+                metadata=error_metadata,
+            )
+        )
+
+    def skip_step(
+        self, step_type: PipelineStepType, reason: str = ""
+    ) -> None:
+        """Record a skipped pipeline step."""
+        self.events.append(
+            PipelineStepEvent.create(
+                step_type=step_type,
+                status=PipelineStepStatus.SKIPPED,
+                metadata={"reason": reason} if reason else {},
+            )
+        )
 
 
 logger = logging.getLogger(__name__)
@@ -1658,6 +1734,16 @@ class NvidiaRAG:
             self._extract_text_from_content(query),
         )
 
+        # Initialize pipeline step tracker for visualization dashboard
+        tracker = PipelineStepTracker()
+
+        # Track INTAKE step - query received and validation started
+        query_text = self._extract_text_from_content(query)
+        tracker.start_step(
+            PipelineStepType.INTAKE,
+            {"query_length": len(query_text) if isinstance(query_text, str) else 0},
+        )
+
         try:
             # Apply default from config for None value
             confidence_threshold = (
@@ -2085,6 +2171,22 @@ class NvidiaRAG:
 
             # Get relevant documents with optional reflection
             if self.config.reflection.enable_reflection:
+                # Complete INTAKE step before reflection-based retrieval
+                tracker.complete_step(
+                    PipelineStepType.INTAKE,
+                    {"collections": validated_collections, "reflection_enabled": True},
+                )
+                # For reflection path, retrieval/reranking happens inside check_context_relevance
+                # Mark these steps as running (they'll complete when the function returns)
+                tracker.start_step(
+                    PipelineStepType.EMBEDDING,
+                    {"model": self.config.embeddings.model_name},
+                )
+                tracker.start_step(
+                    PipelineStepType.RETRIEVAL,
+                    {"collections": validated_collections, "top_k": top_k},
+                )
+
                 reflection_counter = ReflectionCounter(self.config.reflection.max_loops)
 
                 try:
@@ -2120,6 +2222,25 @@ class NvidiaRAG:
                     # Re-raise APIError as-is
                     raise
 
+                # Complete EMBEDDING and RETRIEVAL steps after reflection-based retrieval
+                tracker.complete_step(
+                    PipelineStepType.EMBEDDING,
+                    {"model": self.config.embeddings.model_name},
+                )
+                tracker.complete_step(
+                    PipelineStepType.RETRIEVAL,
+                    {"documents_retrieved": len(context_to_show), "reflection_enabled": True},
+                )
+                # Track RERANKING for reflection path
+                if ranker and enable_reranker:
+                    tracker.start_step(PipelineStepType.RERANKING, {"model": reranker_model})
+                    tracker.complete_step(
+                        PipelineStepType.RERANKING,
+                        {"documents_reranked": len(context_to_show)},
+                    )
+                else:
+                    tracker.skip_step(PipelineStepType.RERANKING, "reranker disabled")
+
                 # Normalize scores to 0-1 range
                 if ranker and enable_reranker:
                     context_to_show = self._normalize_relevance_scores(context_to_show)
@@ -2130,6 +2251,12 @@ class NvidiaRAG:
                         reflection_counter.current_count,
                     )
             else:
+                # Complete INTAKE step - validation done, starting retrieval phase
+                tracker.complete_step(
+                    PipelineStepType.INTAKE,
+                    {"collections": validated_collections},
+                )
+
                 otel_ctx = otel_context.get_current()
                 # Current reranker is not supported for image query
                 if ranker and enable_reranker and not is_image_query:
@@ -2152,6 +2279,18 @@ class NvidiaRAG:
                     docs = []
                     # Start measuring retrieval latency across collections
                     retrieval_start_time = time.time()
+
+                    # Track EMBEDDING step (query embedding happens during retrieval)
+                    tracker.start_step(
+                        PipelineStepType.EMBEDDING,
+                        {"model": self.config.embeddings.model_name},
+                    )
+                    # Track RETRIEVAL step
+                    tracker.start_step(
+                        PipelineStepType.RETRIEVAL,
+                        {"collections": validated_collections, "top_k": top_k},
+                    )
+
                     vectorstores = []
                     for collection_name in validated_collections:
                         vectorstores.append(
@@ -2185,10 +2324,31 @@ class NvidiaRAG:
                         "== Total retrieval time: %.2f ms ==", retrieval_time_ms
                     )
 
+                    # Complete EMBEDDING and RETRIEVAL steps
+                    tracker.complete_step(
+                        PipelineStepType.EMBEDDING,
+                        {"model": self.config.embeddings.model_name},
+                    )
+                    tracker.complete_step(
+                        PipelineStepType.RETRIEVAL,
+                        {
+                            "documents_retrieved": len(docs),
+                            "collections": validated_collections,
+                            "retrieval_time_ms": retrieval_time_ms,
+                        },
+                    )
+
                     context_reranker_start_time = time.time()
                     logger.debug(
                         "Using processed query for reranker %s", processed_query
                     )
+
+                    # Track RERANKING step
+                    tracker.start_step(
+                        PipelineStepType.RERANKING,
+                        {"model": reranker_model or self.config.ranking.model_name, "input_docs": len(docs)},
+                    )
+
                     try:
                         docs = await context_reranker.ainvoke(
                             {"context": docs, "question": processed_query},
@@ -2204,6 +2364,7 @@ class NvidiaRAG:
                         )
                         error_msg = f"Reranker NIM unavailable at {reranker_url}. Please verify the service is running and accessible."
                         logger.error("Connection error in reranker: %s", e)
+                        tracker.fail_step(PipelineStepType.RERANKING, str(e))
                         raise APIError(
                             error_msg, ErrorCodeMapping.SERVICE_UNAVAILABLE
                         ) from e
@@ -2216,11 +2377,32 @@ class NvidiaRAG:
                         context_reranker_time_ms,
                     )
                     context_to_show = docs.get("context", [])
+
+                    # Complete RERANKING step
+                    tracker.complete_step(
+                        PipelineStepType.RERANKING,
+                        {
+                            "model": reranker_model or self.config.ranking.model_name,
+                            "documents_reranked": len(context_to_show),
+                            "context_reranker_time_ms": context_reranker_time_ms,
+                        },
+                    )
                     # Normalize scores to 0-1 range
                     context_to_show = self._normalize_relevance_scores(context_to_show)
                 else:
                     # Multiple retrievers are not supported when reranking is disabled
                     retrieval_start_time = time.time()
+
+                    # Track EMBEDDING and RETRIEVAL steps (no reranking)
+                    tracker.start_step(
+                        PipelineStepType.EMBEDDING,
+                        {"model": self.config.embeddings.model_name},
+                    )
+                    tracker.start_step(
+                        PipelineStepType.RETRIEVAL,
+                        {"collections": validated_collections, "top_k": top_k},
+                    )
+
                     if is_image_query:
                         docs = vdb_op.retrieval_image_langchain(
                             query=retriever_query,
@@ -2250,6 +2432,22 @@ class NvidiaRAG:
                         )
                         context_to_show = docs
                     retrieval_time_ms = (time.time() - retrieval_start_time) * 1000
+
+                    # Complete EMBEDDING and RETRIEVAL steps
+                    tracker.complete_step(
+                        PipelineStepType.EMBEDDING,
+                        {"model": self.config.embeddings.model_name},
+                    )
+                    tracker.complete_step(
+                        PipelineStepType.RETRIEVAL,
+                        {
+                            "documents_retrieved": len(context_to_show),
+                            "collections": validated_collections,
+                            "retrieval_time_ms": retrieval_time_ms,
+                        },
+                    )
+                    # Skip RERANKING step since it's disabled
+                    tracker.skip_step(PipelineStepType.RERANKING, "reranker disabled")
 
             if ranker and enable_reranker and confidence_threshold > 0.0:
                 context_to_show = filter_documents_by_confidence(
@@ -2421,6 +2619,12 @@ class NvidiaRAG:
                         "falling back to regular LLM flow."
                     )
 
+            # Track CONTEXT_ASSEMBLY step
+            tracker.start_step(
+                PipelineStepType.CONTEXT_ASSEMBLY,
+                {"input_documents": len(context_to_show)},
+            )
+
             docs = [self._format_document_with_source(d) for d in context_to_show]
 
             # Prompt for response generation based on context
@@ -2444,6 +2648,16 @@ class NvidiaRAG:
             prompt = ChatPromptTemplate.from_messages(message)
 
             chain = prompt | llm | self.StreamingFilterThinkParser | StrOutputParser()
+
+            # Complete CONTEXT_ASSEMBLY and start GENERATION
+            tracker.complete_step(
+                PipelineStepType.CONTEXT_ASSEMBLY,
+                {"context_chunks": len(docs)},
+            )
+            tracker.start_step(
+                PipelineStepType.GENERATION,
+                {"model": model},
+            )
 
             # Check response groundedness if we still have reflection
             # iterations available
@@ -2498,8 +2712,10 @@ class NvidiaRAG:
                         retrieval_time_ms=retrieval_time_ms,
                         rag_start_time_sec=rag_start_time_sec,
                         otel_metrics_client=metrics,
+                        pipeline_events=tracker.events,
                     ),
                     status_code=ErrorCodeMapping.SUCCESS,
+                    pipeline_events=tracker.events,
                 )
             else:
                 # Create async stream generator
@@ -2521,8 +2737,10 @@ class NvidiaRAG:
                         retrieval_time_ms=retrieval_time_ms,
                         rag_start_time_sec=rag_start_time_sec,
                         otel_metrics_client=metrics,
+                        pipeline_events=tracker.events,
                     ),
                     status_code=ErrorCodeMapping.SUCCESS,
+                    pipeline_events=tracker.events,
                 )
 
         except ConnectTimeout as e:

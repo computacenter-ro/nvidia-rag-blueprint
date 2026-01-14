@@ -30,6 +30,8 @@ import logging
 import os
 import time
 from collections.abc import AsyncGenerator, Generator
+from datetime import datetime, timezone
+from enum import Enum
 from typing import Any, Literal, Optional, Union
 from uuid import uuid4
 
@@ -78,11 +80,17 @@ class APIError(Exception):
 
 
 class RAGResponse:
-    """Wrapper class to hold both the generator and HTTP status code"""
+    """Wrapper class to hold the generator, HTTP status code, and pipeline events."""
 
-    def __init__(self, generator, status_code: int = 200):
+    def __init__(
+        self,
+        generator,
+        status_code: int = 200,
+        pipeline_events: list | None = None,
+    ):
         self.generator = generator
         self.status_code = status_code
+        self.pipeline_events = pipeline_events or []
 
 
 SUMMARY_POLL_INTERVAL_SECONDS = 2
@@ -344,6 +352,60 @@ class Metrics(BaseModel):
     )
 
 
+class PipelineStepType(str, Enum):
+    """Enumeration of pipeline step types for visualization tracking."""
+
+    INTAKE = "intake"
+    EMBEDDING = "embedding"
+    RETRIEVAL = "retrieval"
+    RERANKING = "reranking"
+    CONTEXT_ASSEMBLY = "context_assembly"
+    GENERATION = "generation"
+    OUTPUT = "output"
+
+
+class PipelineStepStatus(str, Enum):
+    """Status of a pipeline step."""
+
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+class PipelineStepEvent(BaseModel):
+    """Represents a single pipeline step event for SSE streaming to visualization dashboards."""
+
+    step_type: PipelineStepType = Field(description="The type of pipeline step")
+    status: PipelineStepStatus = Field(description="Current status of the step")
+    timestamp: str = Field(description="ISO 8601 timestamp of the event")
+    duration_ms: float | None = Field(
+        default=None,
+        ge=0.0,
+        description="Duration of the step in milliseconds (null if running)",
+    )
+    metadata: dict[str, Any] = Field(
+        default_factory=dict, description="Step-specific metadata"
+    )
+
+    @classmethod
+    def create(
+        cls,
+        step_type: PipelineStepType,
+        status: PipelineStepStatus,
+        duration_ms: float | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> "PipelineStepEvent":
+        """Factory method to create a step event with current timestamp."""
+        return cls(
+            step_type=step_type,
+            status=status,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            duration_ms=duration_ms,
+            metadata=metadata or {},
+        )
+
+
 class ChainResponse(BaseModel):
     """Definition of Chain APIs resopnse data type"""
 
@@ -567,6 +629,7 @@ async def generate_answer_async(
     retrieval_time_ms: float | None = None,
     rag_start_time_sec: float | None = None,
     otel_metrics_client: OtelMetrics | None = None,
+    pipeline_events: list[PipelineStepEvent] | None = None,
 ):
     """Generate and stream the response to the provided prompt asynchronously.
 
@@ -577,9 +640,15 @@ async def generate_answer_async(
         collection_name: Name of the collection used for retrieval
         enable_citations: Whether to enable citations in the response
         otel_metrics_client: Optional OpenTelemetry metrics client for updating latency histograms
+        pipeline_events: List of pipeline step events to emit before tokens for visualization
     """
 
     try:
+        # Emit pipeline events at the start (before any tokens) for visualization dashboards
+        if pipeline_events:
+            for event in pipeline_events:
+                yield f"event: pipeline_step\ndata: {event.model_dump_json()}\n\n"
+
         # unique response id for every query
         resp_id = str(uuid4())
         if generator:
@@ -626,6 +695,14 @@ async def generate_answer_async(
                         retrieved_documents=contexts,
                         enable_citations=enable_citations,
                     )
+                    # Emit GENERATION completed event after first token for visualization
+                    gen_complete_event = PipelineStepEvent.create(
+                        step_type=PipelineStepType.GENERATION,
+                        status=PipelineStepStatus.COMPLETED,
+                        duration_ms=llm_ttft_ms,
+                        metadata={"model": model, "llm_ttft_ms": llm_ttft_ms},
+                    )
+                    yield f"event: pipeline_step\ndata: {gen_complete_event.model_dump_json()}\n\n"
                     first_chunk = False
                 logger.debug(response_choice)
                 # Send generator with tokens in ChainResponse format
@@ -633,6 +710,15 @@ async def generate_answer_async(
 
             # Prepare metrics for final chunk
             llm_generation_time_ms = (time.time() - request_start_time) * 1000
+
+            # Emit OUTPUT completed event after all tokens for visualization
+            output_event = PipelineStepEvent.create(
+                step_type=PipelineStepType.OUTPUT,
+                status=PipelineStepStatus.COMPLETED,
+                duration_ms=llm_generation_time_ms,
+                metadata={"total_generation_time_ms": llm_generation_time_ms},
+            )
+            yield f"event: pipeline_step\ndata: {output_event.model_dump_json()}\n\n"
 
             final_metrics = Metrics(
                 rag_ttft_ms=rag_ttft_ms,
